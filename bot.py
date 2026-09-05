@@ -3,24 +3,26 @@ import time
 import requests
 from datetime import datetime, timezone
 
-# GitHub Secrets se credentials aayenge
+# GitHub Secrets
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Delta Exchange India / Global base URL
-# Agar Delta Global use kar rahe hain to "https://api.delta.exchange" use karein
+# Delta Exchange URL & Symbols
 DELTA_BASE_URL = "https://api.india.delta.exchange"
-
-# Delta Exchange Symbols (Perpetual Futures)
 SYMBOLS = ["BTCUSD", "ETHUSD"]
 
 # Timeframes
 TIMEFRAMES = {
-    "5m": 300,   # 5 minute = 300 seconds
-    "15m": 900   # 15 minute = 900 seconds
+    "5m": 300,
+    "15m": 900
 }
 
-LOOKBACK = 20  # Swing high/low track karne ke liye candles
+LOOKBACK = 20
+
+# -------------------------------------------------------------
+# Risk-to-Reward Ratios (Aap apni pasand se adjust kar sakte hain)
+# -------------------------------------------------------------
+RR_RATIOS = [1.5, 2.0, 3.0]  # TP1: 1:1.5 | TP2: 1:2.0 | TP3: 1:3.0
 
 def send_telegram_alert(message):
     if not BOT_TOKEN or not CHAT_ID:
@@ -38,7 +40,6 @@ def send_telegram_alert(message):
         print(f"Telegram error: {e}")
 
 def check_delta_liquidity_sweep(symbol, timeframe, tf_seconds):
-    # Delta Exchange requires UNIX timestamps in seconds
     end_time = int(time.time())
     start_time = end_time - ((LOOKBACK + 10) * tf_seconds)
 
@@ -61,7 +62,6 @@ def check_delta_liquidity_sweep(symbol, timeframe, tf_seconds):
         print(f"Fetch error for {symbol} {timeframe}: {e}")
         return
 
-    # Response validation
     if not data or "result" not in data or not isinstance(data["result"], list):
         return
 
@@ -69,81 +69,83 @@ def check_delta_liquidity_sweep(symbol, timeframe, tf_seconds):
     if len(candles_raw) < LOOKBACK + 2:
         return
 
-    # Delta API candles reverse order me deta he, isliye chronologically sort karein
+    # Chronological sort (oldest to newest)
     candles = sorted(candles_raw, key=lambda x: x["time"])
 
-    # Index -1: Running (incomplete) candle, Index -2: Just closed candle
     closed_candle = candles[-2]
     history_candles = candles[-(LOOKBACK + 2):-2]
 
     candle_high = float(closed_candle["high"])
     candle_low = float(closed_candle["low"])
     candle_close = float(closed_candle["close"])
-    
-    # Candle close timestamp (in seconds)
     close_timestamp = closed_candle["time"] + tf_seconds
 
-    # Swing high aur swing low calculate karein
     swing_high = max(float(c["high"]) for c in history_candles)
     swing_low = min(float(c["low"]) for c in history_candles)
 
-    # UTC Time formatting
     utc_time = datetime.fromtimestamp(close_timestamp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
-    # Sweep Conditions
     bullish_sweep = (candle_low < swing_low) and (candle_close > swing_low)
     bearish_sweep = (candle_high > swing_high) and (candle_close < swing_high)
 
     dec = 2
 
-    # --- BUY / LONG ALERT ---
+    # --- BUY / LONG SETUP ---
     if bullish_sweep:
         entry = candle_close
         sl = candle_low * 0.9995  # 0.05% safety buffer
-        risk = entry - sl
-        tp1 = entry + (risk * 2.0)
-        tp2 = max(entry + (risk * 3.0), swing_high)
+        sl_points = entry - sl     # Total SL Points
+
+        # Take-Profit levels based on SL points
+        tp_text = ""
+        for i, rr in enumerate(RR_RATIOS, 1):
+            target_gain_points = sl_points * rr
+            tp_price = entry + target_gain_points
+            tp_text += f"🎯 *TP {i} (1:{rr} RR):* `${tp_price:,.{dec}f}` `(+{target_gain_points:,.{dec}f} pts)`\n"
 
         msg = (
-            f"🟢 *[DELTA EXCHANGE: BUY / LONG SIGNAL]*\n\n"
-            f"• *Exchange:* `Delta Exchange`\n"
+            f"🟢 *[DELTA EXCHANGE: BUY / LONG SETUP]*\n\n"
             f"• *Symbol:* `{symbol}`\n"
             f"• *Timeframe:* `{timeframe}`\n"
             f"• *Closed Time:* `{utc_time} UTC`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 *Entry Zone:* `${entry:,.{dec}f}` (Retest to `${swing_low:,.{dec}f}`)\n"
-            f"🛑 *Stop-Loss (SL):* `${sl:,.{dec}f}`\n"
-            f"🚀 *Target 1 (1:2 RR):* `${tp1:,.{dec}f}`\n"
-            f"🚀 *Target 2 (1:3 / Swing High):* `${tp2:,.{dec}f}`\n"
+            f"📍 *Entry Price:* `${entry:,.{dec}f}`\n"
+            f"🛑 *Stop-Loss (SL):* `${sl:,.{dec}f}` `(-{sl_points:,.{dec}f} pts)`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 *Risk per Contract:* `${risk:,.{dec}f}`\n"
-            f"💡 *Setup:* Bullish Sweep of `${swing_low:,.{dec}f}` Low"
+            f"📈 *Targets by SL Points:*\n"
+            f"{tp_text}"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 *Setup:* Sweep of `{swing_low:,.{dec}f}` Low"
         )
         send_telegram_alert(msg)
         print(f"Sent Buy Alert: {symbol} {timeframe}")
 
-    # --- SELL / SHORT ALERT ---
+    # --- SELL / SHORT SETUP ---
     elif bearish_sweep:
         entry = candle_close
         sl = candle_high * 1.0005  # 0.05% safety buffer
-        risk = sl - entry
-        tp1 = entry - (risk * 2.0)
-        tp2 = min(entry - (risk * 3.0), swing_low)
+        sl_points = sl - entry     # Total SL Points
+
+        # Take-Profit levels based on SL points
+        tp_text = ""
+        for i, rr in enumerate(RR_RATIOS, 1):
+            target_gain_points = sl_points * rr
+            tp_price = entry - target_gain_points
+            tp_text += f"🎯 *TP {i} (1:{rr} RR):* `${tp_price:,.{dec}f}` `(+{target_gain_points:,.{dec}f} pts)`\n"
 
         msg = (
-            f"🔴 *[DELTA EXCHANGE: SELL / SHORT SIGNAL]*\n\n"
-            f"• *Exchange:* `Delta Exchange`\n"
+            f"🔴 *[DELTA EXCHANGE: SELL / SHORT SETUP]*\n\n"
             f"• *Symbol:* `{symbol}`\n"
             f"• *Timeframe:* `{timeframe}`\n"
             f"• *Closed Time:* `{utc_time} UTC`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 *Entry Zone:* `${entry:,.{dec}f}` (Retest to `${swing_high:,.{dec}f}`)\n"
-            f"🛑 *Stop-Loss (SL):* `${sl:,.{dec}f}`\n"
-            f"🚀 *Target 1 (1:2 RR):* `${tp1:,.{dec}f}`\n"
-            f"🚀 *Target 2 (1:3 / Swing Low):* `${tp2:,.{dec}f}`\n"
+            f"📍 *Entry Price:* `${entry:,.{dec}f}`\n"
+            f"🛑 *Stop-Loss (SL):* `${sl:,.{dec}f}` `(-{sl_points:,.{dec}f} pts)`\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 *Risk per Contract:* `${risk:,.{dec}f}`\n"
-            f"💡 *Setup:* Bearish Sweep of `${swing_high:,.{dec}f}` High"
+            f"📉 *Targets by SL Points:*\n"
+            f"{tp_text}"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 *Setup:* Sweep of `{swing_high:,.{dec}f}` High"
         )
         send_telegram_alert(msg)
         print(f"Sent Sell Alert: {symbol} {timeframe}")
